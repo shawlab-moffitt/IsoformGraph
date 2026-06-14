@@ -10,51 +10,74 @@ library(readr)
 library(ggplot2)
 library(ggtranscript)
 library(patchwork)
+library(tidyr)
 
 edb <- EnsDb.Hsapiens.v86::EnsDb.Hsapiens.v86
 
-#appris_url <- "https://apprisws.bioinfo.cnio.es/pub/current_release/datafiles/homo_sapiens/e110v48/appris_data.appris.txt"
-#https://github.com/shawlab-moffitt/appris_primary_transcripts/blob/main/Gencode48_Ensembl114_appris_data.principal_score.txt.zip
+appris_zip <- "appris.zip"
 
-url <- "https://raw.githubusercontent.com/shawlab-moffitt/appris_primary_transcripts/main/Gencode48_Ensembl114_appris_data.principal_score.txt.zip"
-
-download.file(
-  "https://raw.githubusercontent.com/shawlab-moffitt/appris_primary_transcripts/main/Gencode48_Ensembl114_appris_data.principal_score.txt.zip",
-  destfile = "appris.zip",
-  mode = "wb"
-)
+if (!file.exists(appris_zip)) {
+  download.file(
+    "https://raw.githubusercontent.com/shawlab-moffitt/appris_primary_transcripts/main/Gencode48_Ensembl114_appris_data.principal_score.txt.zip",
+    destfile = appris_zip,
+    mode = "wb"
+  )
+}
 
 appris <- readr::read_tsv(
-  unz("appris.zip",
-      "Gencode48_Ensembl114_appris_data.principal_score.txt"),
+  unz(
+    appris_zip,
+    "Gencode48_Ensembl114_appris_data.principal_score.txt"
+  ),
   col_names = TRUE,
   show_col_types = FALSE
 )
 
 ui <- shiny::fluidPage(
-  shiny::titlePanel("Exon Splicing Graph"),
+  shiny::titlePanel("IsoformGraph: Exon Splicing Graph"),
   
   shiny::sidebarLayout(
     shiny::sidebarPanel(
       shiny::textInput("gene_symbol", "Gene symbol", value = "PTPRC"),
+      
       shiny::numericInput(
-        "tsl_cutoff",
-        "Minimum transcript support level",
-        value = 1,
-        min = 0
+        "plot_width",
+        "Plot width (pixels)",
+        value = 1200,
+        min = 400,
+        max = 5000,
+        step = 100
       ),
+      
+      shiny::numericInput(
+        "plot_height",
+        "Plot height (pixels)",
+        value = 900,
+        min = 400,
+        max = 5000,
+        step = 100
+      ),
+      
       shiny::actionButton("run", "Generate plot")
     ),
     
     shiny::mainPanel(
-      shiny::plotOutput("combined_plot", height = "900px"),
-      shiny::h4("APPRIS transcripts used"),
+      shiny::uiOutput("plot_ui"),
+      shiny::h4("Exon nodes and skipped-exon annotation"),
       shiny::tableOutput("tx_table")
     )
   )
 )
 
 server <- function(input, output, session) {
+  
+  output$plot_ui <- shiny::renderUI({
+    shiny::plotOutput(
+      "combined_plot",
+      width = paste0(input$plot_width, "px"),
+      height = paste0(input$plot_height, "px")
+    )
+  })
   
   gene_data <- shiny::eventReactive(input$run, {
     
@@ -68,7 +91,7 @@ server <- function(input, output, session) {
       dplyr::filter(
         `Transcript type` == "protein_coding",
         `Gene name (HGNC)` == gene_symbol,
-        `Transcript support level` >= input$tsl_cutoff
+        `Transcript support level` >= 1
       )
     
     shiny::validate(
@@ -154,18 +177,22 @@ server <- function(input, output, session) {
     exon_nodes_v2 <- ex2 %>%
       dplyr::mutate(
         exon_5p = dplyr::if_else(strand == "+", start, end),
-        exon_3p = dplyr::if_else(strand == "+", end, start)
+        exon_3p = dplyr::if_else(strand == "+", end, start),
+        exon_node = paste0(start, "-", end)
       ) %>%
       dplyr::distinct(
-        start, end, strand,
+        exon_node,
+        start,
+        end,
+        strand,
         gene_exon_id,
-        exon_5p, exon_3p
+        exon_5p,
+        exon_3p
       ) %>%
       dplyr::arrange(exon_5p) %>%
       dplyr::mutate(
-        exon_order = gene_exon_id,
-        exon_label = paste0("E", gene_exon_id),
-        exon_node = paste0(start, "-", end)
+        exon_order = dplyr::row_number(),
+        exon_label = paste0("E", gene_exon_id)
       )
     
     splice_edges_v2 <- ex2 %>%
@@ -190,7 +217,10 @@ server <- function(input, output, session) {
         exon_nodes_v2 %>%
           dplyr::select(
             exon_node,
-            x_start = exon_order
+            exon_start = start,
+            exon_end = end,
+            x_start = exon_order,
+            donor_label = exon_label
           ),
         by = "exon_node"
       ) %>%
@@ -198,9 +228,77 @@ server <- function(input, output, session) {
         exon_nodes_v2 %>%
           dplyr::select(
             next_exon_node = exon_node,
-            x_end = exon_order
+            next_exon_start = start,
+            next_exon_end = end,
+            x_end = exon_order,
+            acceptor_label = exon_label
           ),
         by = "next_exon_node"
+      ) %>%
+      dplyr::mutate(
+        edge_id = dplyr::row_number(),
+        junction_start = pmin(exon_end, next_exon_start),
+        junction_end = pmax(exon_end, next_exon_start),
+        junction_label = paste0(donor_label, " -> ", acceptor_label),
+        junction_coord = paste0(exon_node, " -> ", next_exon_node)
+      )
+    
+    skipped_hits <- splice_edges_v2 %>%
+      dplyr::left_join(
+        exon_nodes_v2 %>%
+          dplyr::select(
+            skipped_exon_node = exon_node,
+            skipped_exon_label = exon_label,
+            skipped_start = start,
+            skipped_end = end
+          ),
+        by = character()
+      ) %>%
+      dplyr::filter(
+        skipped_exon_node != exon_node,
+        skipped_exon_node != next_exon_node,
+        skipped_start > junction_start,
+        skipped_end > junction_start,
+        skipped_start < junction_end,
+        skipped_end < junction_end
+      )
+    
+    splice_edges_v2 <- splice_edges_v2 %>%
+      dplyr::left_join(
+        skipped_hits %>%
+          dplyr::select(
+            edge_id,
+            skipped_exon_node,
+            skipped_exon_label,
+            skipped_start,
+            skipped_end
+          ),
+        by = "edge_id"
+      ) %>%
+      dplyr::mutate(
+        skips_exon = !is.na(skipped_exon_node)
+      )
+    
+    skip_annotation <- skipped_hits %>%
+      dplyr::group_by(skipped_exon_node) %>%
+      dplyr::summarise(
+        skip_status = "skipped_by_junction",
+        skipping_junction = paste(unique(junction_label), collapse = "; "),
+        skipping_junction_coord = paste(unique(junction_coord), collapse = "; "),
+        n_skipping_junctions = dplyr::n_distinct(edge_id),
+        .groups = "drop"
+      )
+    
+    exon_nodes_v2 <- exon_nodes_v2 %>%
+      dplyr::left_join(
+        skip_annotation,
+        by = c("exon_node" = "skipped_exon_node")
+      ) %>%
+      dplyr::mutate(
+        skip_status = tidyr::replace_na(skip_status, "not_skipped"),
+        skipping_junction = tidyr::replace_na(skipping_junction, ""),
+        skipping_junction_coord = tidyr::replace_na(skipping_junction_coord, ""),
+        n_skipping_junctions = tidyr::replace_na(n_skipping_junctions, 0L)
       )
     
     list(
@@ -208,7 +306,8 @@ server <- function(input, output, session) {
       appris_pc_gene = appris_pc_gene,
       ex_plot = ex_plot,
       exon_nodes_v2 = exon_nodes_v2,
-      splice_edges_v2 = splice_edges_v2
+      splice_edges_v2 = splice_edges_v2,
+      skipped_hits = skipped_hits
     )
   })
   
@@ -261,10 +360,17 @@ server <- function(input, output, session) {
           xmin = exon_order - 0.35,
           xmax = exon_order + 0.35,
           ymin = 0.8,
-          ymax = 1.0
+          ymax = 1.0,
+          fill = skip_status
         ),
-        fill = "grey85",
         color = "black"
+      ) +
+      ggplot2::scale_fill_manual(
+        values = c(
+          "not_skipped" = "grey85",
+          "skipped_by_junction" = "tomato"
+        ),
+        name = "Exon status"
       ) +
       ggplot2::geom_text(
         data = dat$exon_nodes_v2,
@@ -305,15 +411,19 @@ server <- function(input, output, session) {
   output$tx_table <- shiny::renderTable({
     
     dat <- gene_data()
-    dat$exon_nodes_v2
-    #dat$appris_pc_gene %>%
-    #  dplyr::select(
-    #    `Gene name (HGNC)`,
-    #    `Transcript ID`,
-    #    `Transcript type`,
-    #    `Transcript support level`
-    #    #`APPRIS annotation`
-    #  )
+    
+    dat$exon_nodes_v2 %>%
+      dplyr::select(
+        exon_label,
+        exon_node,
+        start,
+        end,
+        strand,
+        skip_status,
+        n_skipping_junctions,
+        skipping_junction,
+        skipping_junction_coord
+      )
   })
 }
 
